@@ -208,7 +208,11 @@ template <typename... Args>
     WriteFile(stderr_handle, buf, strlen(buf), &unused, nullptr);
   }
 #else
-  write(STDERR_FILENO, buf, strlen(buf));
+  int writeLength = write(STDERR_FILENO, buf, strlen(buf));
+  if (writeLength < 0)
+  {
+    abort();
+  }
 #endif
   abort();
 }

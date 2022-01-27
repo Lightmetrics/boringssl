@@ -472,7 +472,10 @@ static bool ssl_crypto_x509_ssl_auto_chain_if_needed(SSL_HANDSHAKE *hs) {
   }
 
   // Attempt to build a chain, ignoring the result.
-  X509_verify_cert(ctx.get());
+  int verify_ret = X509_verify_cert(ctx.get());
+  if (verify_ret < 0) {
+    OPENSSL_PUT_ERROR(SSL, ERR_R_X509_LIB);
+  }
   ERR_clear_error();
 
   // Remove the leaf from the generated chain.
