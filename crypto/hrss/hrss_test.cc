@@ -1,16 +1,16 @@
-/* Copyright (c) 2018, Google Inc.
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
- * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
- * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+// Copyright 2018 The BoringSSL Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <gtest/gtest.h>
 
@@ -50,7 +50,7 @@ TEST(HRSS, Poly3Invert) {
 
   p.s.v[0] = 0;
   p.a.v[0] = 1;
-  for (size_t i = 0; i < N - 1; i++) {
+  for (size_t i = 0; i < HRSS_N - 1; i++) {
     SCOPED_TRACE(i);
     poly3 r;
     OPENSSL_memset(&r, 0, sizeof(r));
@@ -199,6 +199,33 @@ TEST(HRSS, Random) {
       EXPECT_NE(Bytes(shared_key), Bytes(shared_key2));
     }
   }
+}
+
+TEST(HRSS, NoWritesToConstData) {
+  // Normalisation of some polynomials used to write into the generated keys.
+  // This is fine in a purely ephemeral setting, but triggers TSAN warnings in
+  // more complex ones.
+  uint8_t generate_key_entropy[HRSS_GENERATE_KEY_BYTES];
+  RAND_bytes(generate_key_entropy, sizeof(generate_key_entropy));
+  HRSS_public_key pub, pub_orig;
+  HRSS_private_key priv, priv_orig;
+  OPENSSL_memset(&pub, 0xa3, sizeof(pub));
+  OPENSSL_memset(&priv, 0x3a, sizeof(priv));
+  ASSERT_TRUE(HRSS_generate_key(&pub, &priv, generate_key_entropy));
+  OPENSSL_memcpy(&priv_orig, &priv, sizeof(priv));
+  OPENSSL_memcpy(&pub_orig, &pub, sizeof(pub));
+
+  uint8_t ciphertext[HRSS_CIPHERTEXT_BYTES];
+  uint8_t shared_key[HRSS_KEY_BYTES];
+  uint8_t encap_entropy[HRSS_ENCAP_BYTES];
+  RAND_bytes(encap_entropy, sizeof(encap_entropy));
+  ASSERT_TRUE(HRSS_encap(ciphertext, shared_key, &pub, encap_entropy));
+
+  ASSERT_EQ(OPENSSL_memcmp(&pub, &pub_orig, sizeof(pub)), 0);
+
+  ASSERT_TRUE(HRSS_decap(shared_key, &priv, ciphertext, sizeof(ciphertext)));
+
+  ASSERT_EQ(OPENSSL_memcmp(&priv, &priv_orig, sizeof(priv)), 0);
 }
 
 TEST(HRSS, Golden) {
@@ -453,21 +480,23 @@ TEST(HRSS, Golden) {
 
 #if defined(POLY_RQ_MUL_ASM) && defined(SUPPORTS_ABI_TEST)
 TEST(HRSS, ABI) {
-  const bool has_avx2 = (OPENSSL_ia32cap_P[2] & (1 << 5)) != 0;
-  if (!has_avx2) {
+  if (!CRYPTO_is_AVX2_capable()) {
     fprintf(stderr, "Skipping ABI test due to lack of AVX2 support.\n");
     return;
   }
 
-  alignas(16) uint16_t r[N + 3];
-  alignas(16) uint16_t a[N + 3] = {0};
-  alignas(16) uint16_t b[N + 3] = {0};
+  alignas(16) uint16_t r[HRSS_N + 3];
+  alignas(16) uint16_t a[HRSS_N + 3] = {0};
+  alignas(16) uint16_t b[HRSS_N + 3] = {0};
 
   uint8_t kCanary[256];
-  OPENSSL_STATIC_ASSERT(sizeof(kCanary) % 32 == 0, "needed for alignment");
+  static_assert(sizeof(kCanary) % 32 == 0, "needed for alignment");
   memset(kCanary, 42, sizeof(kCanary));
-  alignas(32) uint8_t
-      scratch[sizeof(kCanary) + POLY_MUL_RQ_SCRATCH_SPACE + sizeof(kCanary)];
+
+  auto scratch_buf = std::make_unique<uint8_t[]>(
+      32 + sizeof(kCanary) + POLY_MUL_RQ_SCRATCH_SPACE + sizeof(kCanary));
+  uint8_t *scratch =
+      static_cast<uint8_t *>(align_pointer(scratch_buf.get(), 32));
   OPENSSL_memcpy(scratch, kCanary, sizeof(kCanary));
   OPENSSL_memcpy(scratch + sizeof(kCanary) + POLY_MUL_RQ_SCRATCH_SPACE, kCanary,
                  sizeof(kCanary));

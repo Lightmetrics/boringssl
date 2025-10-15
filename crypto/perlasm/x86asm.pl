@@ -1,10 +1,17 @@
 #! /usr/bin/env perl
 # Copyright 1995-2018 The OpenSSL Project Authors. All Rights Reserved.
 #
-# Licensed under the OpenSSL license (the "License").  You may not use
-# this file except in compliance with the License.  You can obtain a copy
-# in the file LICENSE in the source distribution or at
-# https://www.openssl.org/source/license.html
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 
 # require 'x86asm.pl';
@@ -42,10 +49,10 @@ sub ::record_function_hit
     &preprocessor_ifdef("BORINGSSL_DISPATCH_TEST");
     &push("ebx");
     &push("edx");
-    &call(&label("pic"));
-    &set_label("pic");
+    &call(&label("pic_for_function_hit"));
+    &set_label("pic_for_function_hit");
     &blindpop("ebx");
-    &lea("ebx",&DWP("BORINGSSL_function_hit+$index"."-".&label("pic"),"ebx"));
+    &lea("ebx",&DWP("BORINGSSL_function_hit+$index"."-".&label("pic_for_function_hit"),"ebx"));
     &mov("edx", 1);
     &movb(&BP(0, "ebx"), "dl");
     &pop("edx");
@@ -284,22 +291,38 @@ $comment source tree. Do not edit by hand.
 ___
     if ($win32) {
         print <<___ unless $masm;
-%ifdef BORINGSSL_PREFIX
-%include "boringssl_prefix_symbols_nasm.inc"
-%endif
+\%ifdef BORINGSSL_PREFIX
+\%include "boringssl_prefix_symbols_nasm.inc"
+\%endif
+\%ifidn __OUTPUT_FORMAT__, win32
+___
+        print @out;
+        print <<___ unless $masm;
+\%else
+; Work around https://bugzilla.nasm.us/show_bug.cgi?id=3392738
+ret
+\%endif
 ___
     } else {
+        my $target;
+        if ($elf) {
+            $target = "defined(__ELF__)";
+        } elsif ($macosx) {
+            $target = "defined(__APPLE__)";
+        } else {
+            die "unknown target";
+        }
+
         print <<___;
-#if defined(__i386__)
-#if defined(BORINGSSL_PREFIX)
-#include <boringssl_prefix_symbols_asm.h>
-#endif
+#include <openssl/asm_base.h>
+
+#if !defined(OPENSSL_NO_ASM) && defined(OPENSSL_X86) && $target
+___
+        print @out;
+        print <<___;
+#endif  // !defined(OPENSSL_NO_ASM) && defined(OPENSSL_X86) && $target
 ___
     }
-    print @out;
-    print "#endif\n" unless ($win32);
-    # See https://www.airs.com/blog/archives/518.
-    print ".section\t.note.GNU-stack,\"\",\@progbits\n" if ($elf);
 }
 
 sub ::asm_init

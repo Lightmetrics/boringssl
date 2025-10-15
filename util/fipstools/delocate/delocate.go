@@ -1,39 +1,42 @@
-// Copyright (c) 2017, Google Inc.
+// Copyright 2017 The BoringSSL Authors
 //
-// Permission to use, copy, modify, and/or distribute this software for any
-// purpose with or without fee is hereby granted, provided that the above
-// copyright notice and this permission notice appear in all copies.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
-// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
-// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
-// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // delocate performs several transformations of textual assembly code. See
 // crypto/fipsmodule/FIPS.md for an overview.
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
-	"boringssl.googlesource.com/boringssl/util/ar"
-	"boringssl.googlesource.com/boringssl/util/fipstools/fipscommon"
+	"boringssl.googlesource.com/boringssl.git/util/ar"
+	"boringssl.googlesource.com/boringssl.git/util/fipstools/fipscommon"
 )
 
 // inputFile represents a textual assembly file.
 type inputFile struct {
 	path string
-	// index is a unique identifer given to this file. It's used for
+	// index is a unique identifier given to this file. It's used for
 	// mapping local symbols.
 	index int
 	// isArchive indicates that the input should be processed as an ar
@@ -46,14 +49,14 @@ type inputFile struct {
 }
 
 type stringWriter interface {
+	io.Writer
 	WriteString(string) (int, error)
 }
 
 type processorType int
 
 const (
-	ppc64le processorType = iota + 1
-	x86_64
+	x86_64 processorType = iota + 1
 	aarch64
 )
 
@@ -66,8 +69,6 @@ type delocation struct {
 
 	// symbols is the set of symbols defined in the module.
 	symbols map[string]struct{}
-	// localEntrySymbols is the set of symbols with .localentry directives.
-	localEntrySymbols map[string]struct{}
 	// redirectors maps from out-call symbol name to the name of a
 	// redirector function for that symbol. E.g. “memcpy” ->
 	// “bcm_redirector_memcpy”.
@@ -76,9 +77,6 @@ type delocation struct {
 	// should be used to reference it. E.g. “P384_data_storage” ->
 	// “P384_data_storage”.
 	bssAccessorsNeeded map[string]string
-	// tocLoaders is a set of symbol names for which TOC helper functions
-	// are required. (ppc64le only.)
-	tocLoaders map[string]struct{}
 	// gotExternalsNeeded is a set of symbol names for which we need
 	// “delta” symbols: symbols that contain the offset from their location
 	// to the memory in question.
@@ -149,14 +147,14 @@ func (d *delocation) processInput(input inputFile) (err error) {
 			statement, err = d.processDirective(statement, node.up)
 		case ruleLabelContainingDirective:
 			statement, err = d.processLabelContainingDirective(statement, node.up)
+		case ruleSymbolDefiningDirective:
+			statement, err = d.processSymbolDefiningDirective(statement, node.up)
 		case ruleLabel:
 			statement, err = d.processLabel(statement, node.up)
 		case ruleInstruction:
 			switch d.processor {
 			case x86_64:
 				statement, err = d.processIntelInstruction(statement, node.up)
-			case ppc64le:
-				statement, err = d.processPPCInstruction(statement, node.up)
 			case aarch64:
 				statement, err = d.processAarch64Instruction(statement, node.up)
 			default:
@@ -210,6 +208,10 @@ func (d *delocation) processDirective(statement, directive *node32) (*node32, er
 		// will have to work around this in the future.
 		return nil, errors.New(".data section found in module")
 
+	case "bss":
+		d.writeNode(statement)
+		return d.handleBSS(statement)
+
 	case "section":
 		section := args[0]
 
@@ -253,7 +255,7 @@ func (d *delocation) processDirective(statement, directive *node32) (*node32, er
 			d.writeNode(statement)
 			break
 
-		case ".debug", ".note", ".toc":
+		case ".debug", ".note":
 			d.writeNode(statement)
 			break
 
@@ -267,6 +269,47 @@ func (d *delocation) processDirective(statement, directive *node32) (*node32, er
 	}
 
 	return statement, nil
+}
+
+func (d *delocation) processSymbolExpr(expr *node32, b *strings.Builder) bool {
+	changed := false
+	assertNodeType(expr, ruleSymbolExpr)
+
+	for expr != nil {
+		atom := expr.up
+		assertNodeType(atom, ruleSymbolAtom)
+
+		for term := atom.up; term != nil; term = skipWS(term.next) {
+			if term.pegRule == ruleSymbolExpr {
+				changed = d.processSymbolExpr(term, b) || changed
+				continue
+			}
+
+			if term.pegRule != ruleLocalSymbol {
+				b.WriteString(d.contents(term))
+				continue
+			}
+
+			oldSymbol := d.contents(term)
+			newSymbol := d.mapLocalSymbol(oldSymbol)
+			if newSymbol != oldSymbol {
+				changed = true
+			}
+
+			b.WriteString(newSymbol)
+		}
+
+		next := skipWS(atom.next)
+		if next == nil {
+			break
+		}
+		assertNodeType(next, ruleSymbolOperator)
+		b.WriteString(d.contents(next))
+		next = skipWS(next.next)
+		assertNodeType(next, ruleSymbolExpr)
+		expr = next
+	}
+	return changed
 }
 
 func (d *delocation) processLabelContainingDirective(statement, directive *node32) (*node32, error) {
@@ -286,24 +329,12 @@ func (d *delocation) processLabelContainingDirective(statement, directive *node3
 	for node = skipWS(node.up); node != nil; node = skipWS(node.next) {
 		assertNodeType(node, ruleSymbolArg)
 		arg := node.up
-		var mapped string
+		assertNodeType(arg, ruleSymbolExpr)
 
-		for term := arg; term != nil; term = term.next {
-			if term.pegRule != ruleLocalSymbol {
-				mapped += d.contents(term)
-				continue
-			}
+		var b strings.Builder
+		changed = d.processSymbolExpr(arg, &b) || changed
 
-			oldSymbol := d.contents(term)
-			newSymbol := d.mapLocalSymbol(oldSymbol)
-			if newSymbol != oldSymbol {
-				changed = true
-			}
-
-			mapped += newSymbol
-		}
-
-		args = append(args, mapped)
+		args = append(args, b.String())
 	}
 
 	if !changed {
@@ -313,8 +344,43 @@ func (d *delocation) processLabelContainingDirective(statement, directive *node3
 		d.output.WriteString("\t" + name + "\t" + strings.Join(args, ", ") + "\n")
 	}
 
-	if name == ".localentry" {
-		d.output.WriteString(localEntryName(args[0]) + ":\n")
+	return statement, nil
+}
+
+func (d *delocation) processSymbolDefiningDirective(statement, directive *node32) (*node32, error) {
+	changed := false
+	assertNodeType(directive, ruleSymbolDefiningDirectiveName)
+	name := d.contents(directive)
+
+	node := directive.next
+	assertNodeType(node, ruleWS)
+
+	node = node.next
+	symbol := d.contents(node)
+	isLocal := node.pegRule == ruleLocalSymbol
+	if isLocal {
+		symbol = d.mapLocalSymbol(symbol)
+		changed = true
+	} else {
+		assertNodeType(node, ruleSymbolName)
+	}
+
+	node = skipWS(node.next)
+	assertNodeType(node, ruleSymbolArg)
+	assertNodeType(node.up, ruleSymbolExpr)
+	var b strings.Builder
+	changed = d.processSymbolExpr(node.up, &b) || changed
+	arg := b.String()
+
+	if !changed {
+		d.writeNode(statement)
+	} else {
+		d.writeCommentedNode(statement)
+		fmt.Fprintf(d.output, "\t%s\t%s, %s\n", name, symbol, arg)
+	}
+
+	if !isLocal {
+		fmt.Fprintf(d.output, "\t%s\t%s, %s\n", name, localTargetName(symbol), arg)
 	}
 
 	return statement, nil
@@ -392,18 +458,13 @@ func (d *delocation) loadAarch64Address(statement *node32, targetReg string, sym
 		panic("non-zero offset for helper-based reference")
 	}
 
-	var helperFunc string
-	if symbol == "OPENSSL_armcap_P" {
-		helperFunc = ".LOPENSSL_armcap_P_addr"
-	} else {
-		// GOT helpers also dereference the GOT entry, thus the subsequent ldr
-		// instruction, which would normally do the dereferencing, needs to be
-		// dropped. GOT helpers have to include the dereference because the
-		// assembler doesn't support ":got_lo12:foo" offsets except in an ldr
-		// instruction.
-		d.gotExternalsNeeded[symbol] = struct{}{}
-		helperFunc = gotHelperName(symbol)
-	}
+	// GOT helpers also dereference the GOT entry, thus the subsequent ldr
+	// instruction, which would normally do the dereferencing, needs to be
+	// dropped. GOT helpers have to include the dereference because the
+	// assembler doesn't support ":got_lo12:foo" offsets except in an ldr
+	// instruction.
+	d.gotExternalsNeeded[symbol] = struct{}{}
+	helperFunc := gotHelperName(symbol)
 
 	// Clear the red-zone. I can't find a definitive answer about whether Linux
 	// Aarch64 includes a red-zone, but Microsoft has a 16-byte one and Apple a
@@ -439,7 +500,7 @@ func (d *delocation) processAarch64Instruction(statement, instruction *node32) (
 	argNodes := instructionArgs(instruction.next)
 
 	switch instructionName {
-	case "cset", "csel", "csetm", "cneg", "csinv", "cinc", "csinc", "csneg":
+	case "ccmn", "ccmp", "cinc", "cinv", "cneg", "csel", "cset", "csetm", "csinc", "csinv", "csneg":
 		// These functions are special because they take a condition-code name as
 		// an argument and that looks like a symbol reference.
 		d.writeNode(statement)
@@ -509,7 +570,7 @@ func (d *delocation) processAarch64Instruction(statement, instruction *node32) (
 				// This is a branch. Either the target needs to be written to a local
 				// version of the symbol to ensure that no relocations are emitted, or
 				// it needs to jump to a redirector function.
-				symbol, _, _, didChange, symbolIsLocal, _ := d.parseMemRef(arg.up)
+				symbol, offset, _, didChange, symbolIsLocal, _ := d.parseMemRef(arg.up)
 				changed = didChange
 
 				if _, knownSymbol := d.symbols[symbol]; knownSymbol {
@@ -520,6 +581,13 @@ func (d *delocation) processAarch64Instruction(statement, instruction *node32) (
 					d.redirectors[symbol] = redirector
 					symbol = redirector
 					changed = true
+				} else if didChange && symbolIsLocal && len(offset) > 0 {
+					// didChange is set when the inputFile index is not 0; which is the index of the
+					// first file copied to the output, which is the generated assembly of bcm.c.
+					// In subsequently copied assembly files, local symbols are changed by appending (BCM_ + index)
+					// in order to ensure they don't collide. `index` gets incremented per file.
+					// If there is offset after the symbol, append the `offset`.
+					symbol = symbol + offset
 				}
 
 				args = append(args, symbol)
@@ -559,15 +627,21 @@ func (d *delocation) processAarch64Instruction(statement, instruction *node32) (
 						}
 						return statement, nil
 					} else if parts.pegRule == ruleLow12BitsSymbolRef {
-						if instructionName != "ldr" {
-							panic("Symbol reference outside of ldr instruction")
+						switch instructionName {
+						case "ldr", "ldrh", "ldrb", "ldrsw", "ldrsh", "ldrsb":
+						default:
+							panic("Symbol reference outside of load instruction")
 						}
 
-						if skipWS(parts.next) != nil || parts.up.next != nil {
-							panic("can't handle tweak or post-increment with symbol references")
-						}
-
-						// Suppress the offset; adrp loaded the full address.
+						// Suppress the offset; adrp loaded the full address. This assumes the
+						// the compiler does not emit code like the following:
+						//
+						//   adrp x0, symbol
+						//   ldr x1, [x0, :lo12:symbol]
+						//   ldr x2, [x0, :lo12:symbol+4]
+						//
+						// Such code would only work if lo12(symbol+4) = lo12(symbol) + 4, but
+						// this is true when symbol is sufficiently aligned.
 						args = append(args, "["+baseAddrReg+"]")
 						changed = true
 						continue
@@ -584,6 +658,15 @@ func (d *delocation) processAarch64Instruction(statement, instruction *node32) (
 				// The adrp instruction will have been turned into a sequence that loads
 				// the full address, above, thus the offset is turned into zero. If that
 				// results in the instruction being a nop, then it is deleted.
+				//
+				// This assumes the compiler does not emit code like the following:
+				//
+				//   adrp x0, symbol
+				//   add x1, x0, :lo12:symbol
+				//   add x2, x0, :lo12:symbol+4
+				//
+				// Such code would only work if lo12(symbol+4) = lo12(symbol) + 4, but
+				// this is true when symbol is sufficiently aligned.
 				if instructionName != "add" {
 					panic(fmt.Sprintf("unsure how to handle %q instruction using lo12", instructionName))
 				}
@@ -618,191 +701,6 @@ func (d *delocation) processAarch64Instruction(statement, instruction *node32) (
 	}
 
 	return statement, nil
-}
-
-/* ppc64le
-
-[PABI]: “64-Bit ELF V2 ABI Specification. Power Architecture.” March 21st,
-        2017
-
-(Also useful is “Power ISA Version 2.07 B”. Note that version three of that
-document is /not/ good as that's POWER9 specific.)
-
-ppc64le doesn't have IP-relative addressing and does a lot to work around this.
-Rather than reference a PLT and GOT direction, it has a single structure called
-the TOC (Table Of Contents). Within the TOC is the contents of .rodata, .data,
-.got, .plt, .bss, etc sections [PABI;3.3].
-
-A pointer to the TOC is maintained in r2 and the following pattern is used to
-load the address of an element into a register:
-
-  addis <address register>, 2, foo@toc@ha
-  addi <address register>, <address register>, foo@toc@l
-
-The “addis” instruction shifts a signed constant left 16 bits and adds the
-result to its second argument, saving the result in the first argument. The
-“addi” instruction does the same, but without shifting. Thus the “@toc@ha"
-suffix on a symbol means “the top 16 bits of the TOC offset” and “@toc@l” means
-“the bottom 16 bits of the offset”. However, note that both values are signed,
-thus offsets in the top half of a 64KB chunk will have an @ha value that's one
-greater than expected and a negative @l value.
-
-The TOC is specific to a “module” (basically an executable or shared object).
-This means that there's not a single TOC in a process and that r2 needs to
-change as control moves between modules. Thus functions have two entry points:
-the “global” entry point and the “local” entry point. Jumps from within the
-same module can use the local entry while jumps from other modules must use the
-global entry. The global entry establishes the correct value of r2 before
-running the function and the local entry skips that code.
-
-The global entry point for a function is defined by its label. The local entry
-is a power-of-two number of bytes from the global entry, set by the
-“.localentry” directive. (ppc64le instructions are always 32 bits, so an offset
-of 1 or 2 bytes is treated as an offset of zero.)
-
-In order to help the global entry code set r2 to point to the local TOC, r12 is
-set to the address of the global entry point when called [PABI;2.2.1.1]. Thus
-the global entry will typically use an addis+addi pair to add a known offset to
-r12 and store it in r2. For example:
-
-foo:
-  addis 2, 12, .TOC. - foo@ha
-  addi  2, 2,  .TOC. - foo@l
-
-(It's worth noting that the '@' operator binds very loosely, so the 3rd
-arguments parse as (.TOC. - foo)@ha and (.TOC. - foo)@l.)
-
-When calling a function, the compiler doesn't know whether that function is in
-the same module or not. Thus it doesn't know whether r12 needs to be set nor
-whether r2 will be clobbered on return. Rather than always assume the worst,
-the linker fixes stuff up once it knows that a call is going out of module:
-
-Firstly, calling, say, memcpy (which we assume to be in a different module)
-won't actually jump directly to memcpy, or even a PLT resolution function.
-It'll call a synthesised function that:
-  a) saves r2 in the caller's stack frame
-  b) loads the address of memcpy@PLT into r12
-  c) jumps to r12.
-
-As this synthesised function loads memcpy@PLT, a call to memcpy from the
-compiled code just references “memcpy” directly, not “memcpy@PLT”.
-
-Since it jumps directly to memcpy@PLT, it can't restore r2 on return. Thus
-calls must be followed by a nop. If the call ends up going out-of-module, the
-linker will rewrite that nop to load r2 from the stack.
-
-Speaking of the stack, the stack pointer is kept in r1 and there's a 288-byte
-red-zone. The format of the stack frame is defined [PABI;2.2.2] and must be
-followed as called functions will write into their parent's stack frame. For
-example, the synthesised out-of-module trampolines will save r2 24 bytes into
-the caller's frame and all non-leaf functions save the return address 16 bytes
-into the caller's frame.
-
-A final point worth noting: some RISC ISAs have r0 wired to zero: all reads
-result in zero and all writes are discarded. POWER does something a little like
-that, but r0 is only special in certain argument positions for certain
-instructions. You just have to read the manual to know which they are.
-
-
-Delocation is easier than Intel because there's just TOC references, but it's
-also harder because there's no IP-relative addressing.
-
-Jumps are IP-relative however, and have a 24-bit immediate value. So we can
-jump to functions that set a register to the needed value. (r3 is the
-return-value register and so that's what is generally used here.) */
-
-// isPPC64LEAPair recognises an addis+addi pair that's adding the offset of
-// source to relative and writing the result to target.
-func (d *delocation) isPPC64LEAPair(statement *node32) (target, source, relative string, ok bool) {
-	instruction := skipWS(statement.up).up
-	assertNodeType(instruction, ruleInstructionName)
-	name1 := d.contents(instruction)
-	args1 := instructionArgs(instruction.next)
-
-	statement = statement.next
-	instruction = skipWS(statement.up).up
-	assertNodeType(instruction, ruleInstructionName)
-	name2 := d.contents(instruction)
-	args2 := instructionArgs(instruction.next)
-
-	if name1 != "addis" ||
-		len(args1) != 3 ||
-		name2 != "addi" ||
-		len(args2) != 3 {
-		return "", "", "", false
-	}
-
-	target = d.contents(args1[0])
-	relative = d.contents(args1[1])
-	source1 := d.contents(args1[2])
-	source2 := d.contents(args2[2])
-
-	if !strings.HasSuffix(source1, "@ha") ||
-		!strings.HasSuffix(source2, "@l") ||
-		source1[:len(source1)-3] != source2[:len(source2)-2] ||
-		d.contents(args2[0]) != target ||
-		d.contents(args2[1]) != target {
-		return "", "", "", false
-	}
-
-	source = source1[:len(source1)-3]
-	ok = true
-	return
-}
-
-// establishTOC writes the global entry prelude for a function. The standard
-// prelude involves relocations so this version moves the relocation outside
-// the integrity-checked area.
-func establishTOC(w stringWriter) {
-	w.WriteString("999:\n")
-	w.WriteString("\taddis 2, 12, .LBORINGSSL_external_toc-999b@ha\n")
-	w.WriteString("\taddi 2, 2, .LBORINGSSL_external_toc-999b@l\n")
-	w.WriteString("\tld 12, 0(2)\n")
-	w.WriteString("\tadd 2, 2, 12\n")
-}
-
-// loadTOCFuncName returns the name of a synthesized function that sets r3 to
-// the value of “symbol+offset”.
-func loadTOCFuncName(symbol, offset string) string {
-	symbol = strings.Replace(symbol, ".", "_dot_", -1)
-	ret := ".Lbcm_loadtoc_" + symbol
-	if len(offset) != 0 {
-		offset = strings.Replace(offset, "+", "_plus_", -1)
-		offset = strings.Replace(offset, "-", "_minus_", -1)
-		ret += "_" + offset
-	}
-	return ret
-}
-
-func (d *delocation) loadFromTOC(w stringWriter, symbol, offset, dest string) wrapperFunc {
-	d.tocLoaders[symbol+"\x00"+offset] = struct{}{}
-
-	return func(k func()) {
-		w.WriteString("\taddi 1, 1, -288\n")   // Clear the red zone.
-		w.WriteString("\tmflr " + dest + "\n") // Stash the link register.
-		w.WriteString("\tstd " + dest + ", -8(1)\n")
-		// The TOC loader will use r3, so stash it if necessary.
-		if dest != "3" {
-			w.WriteString("\tstd 3, -16(1)\n")
-		}
-
-		// Because loadTOCFuncName returns a “.L” name, we don't need a
-		// nop after this call.
-		w.WriteString("\tbl " + loadTOCFuncName(symbol, offset) + "\n")
-
-		// Cycle registers around. We need r3 -> destReg, -8(1) ->
-		// lr and, optionally, -16(1) -> r3.
-		w.WriteString("\tstd 3, -24(1)\n")
-		w.WriteString("\tld 3, -8(1)\n")
-		w.WriteString("\tmtlr 3\n")
-		w.WriteString("\tld " + dest + ", -24(1)\n")
-		if dest != "3" {
-			w.WriteString("\tld 3, -16(1)\n")
-		}
-		w.WriteString("\taddi 1, 1, 288\n")
-
-		k()
-	}
 }
 
 func (d *delocation) gatherOffsets(symRef *node32, offsets string) (*node32, string) {
@@ -857,215 +755,6 @@ func (d *delocation) parseMemRef(memRef *node32) (symbol, offset, section string
 	}
 
 	return
-}
-
-func (d *delocation) processPPCInstruction(statement, instruction *node32) (*node32, error) {
-	assertNodeType(instruction, ruleInstructionName)
-	instructionName := d.contents(instruction)
-	isBranch := instructionName[0] == 'b'
-
-	argNodes := instructionArgs(instruction.next)
-
-	var wrappers wrapperStack
-	var args []string
-	changed := false
-
-Args:
-	for i, arg := range argNodes {
-		fullArg := arg
-		isIndirect := false
-
-		if arg.pegRule == ruleIndirectionIndicator {
-			arg = arg.next
-			isIndirect = true
-		}
-
-		switch arg.pegRule {
-		case ruleRegisterOrConstant, ruleLocalLabelRef:
-			args = append(args, d.contents(fullArg))
-
-		case ruleTOCRefLow:
-			return nil, errors.New("Found low TOC reference outside preamble pattern")
-
-		case ruleTOCRefHigh:
-			target, _, relative, ok := d.isPPC64LEAPair(statement)
-			if !ok {
-				return nil, errors.New("Found high TOC reference outside preamble pattern")
-			}
-
-			if relative != "12" {
-				return nil, fmt.Errorf("preamble is relative to %q, not r12", relative)
-			}
-
-			if target != "2" {
-				return nil, fmt.Errorf("preamble is setting %q, not r2", target)
-			}
-
-			statement = statement.next
-			establishTOC(d.output)
-			instructionName = ""
-			changed = true
-			break Args
-
-		case ruleMemoryRef:
-			symbol, offset, section, didChange, symbolIsLocal, memRef := d.parseMemRef(arg.up)
-			changed = didChange
-
-			if len(symbol) > 0 {
-				if _, localEntrySymbol := d.localEntrySymbols[symbol]; localEntrySymbol && isBranch {
-					symbol = localEntryName(symbol)
-					changed = true
-				} else if _, knownSymbol := d.symbols[symbol]; knownSymbol {
-					symbol = localTargetName(symbol)
-					changed = true
-				} else if !symbolIsLocal && !isSynthesized(symbol) && len(section) == 0 {
-					changed = true
-					d.redirectors[symbol] = redirectorName(symbol)
-					symbol = redirectorName(symbol)
-					// TODO(davidben): This should sanity-check the next
-					// instruction is a nop and ideally remove it.
-					wrappers = append(wrappers, func(k func()) {
-						k()
-						// Like the linker's PLT stubs, redirector functions
-						// expect callers to restore r2.
-						d.output.WriteString("\tld 2, 24(1)\n")
-					})
-				}
-			}
-
-			switch section {
-			case "":
-
-			case "tls":
-				// This section identifier just tells the
-				// assembler to use r13, the pointer to the
-				// thread-local data [PABI;3.7.3.3].
-
-			case "toc@ha":
-				// Delete toc@ha instructions. Per
-				// [PABI;3.6.3], the linker is allowed to erase
-				// toc@ha instructions. We take advantage of
-				// this by unconditionally erasing the toc@ha
-				// instructions and doing the full lookup when
-				// processing toc@l.
-				//
-				// Note that any offset here applies before @ha
-				// and @l. That is, 42+foo@toc@ha is
-				// #ha(42+foo-.TOC.), not 42+#ha(foo-.TOC.). Any
-				// corresponding toc@l references are required
-				// by the ABI to have the same offset. The
-				// offset will be incorporated in full when
-				// those are processed.
-				if instructionName != "addis" || len(argNodes) != 3 || i != 2 || args[1] != "2" {
-					return nil, errors.New("can't process toc@ha reference")
-				}
-				changed = true
-				instructionName = ""
-				break Args
-
-			case "toc@l":
-				// Per [PAB;3.6.3], this instruction must take
-				// as input a register which was the output of
-				// a toc@ha computation and compute the actual
-				// address of some symbol. The toc@ha
-				// computation was elided, so we ignore that
-				// input register and compute the address
-				// directly.
-				changed = true
-
-				// For all supported toc@l instructions, the
-				// destination register is the first argument.
-				destReg := args[0]
-
-				wrappers = append(wrappers, d.loadFromTOC(d.output, symbol, offset, destReg))
-				switch instructionName {
-				case "addi":
-					// The original instruction was:
-					//   addi destReg, tocHaReg, offset+symbol@toc@l
-					instructionName = ""
-
-				case "ld", "lhz", "lwz":
-					// The original instruction was:
-					//   l?? destReg, offset+symbol@toc@l(tocHaReg)
-					//
-					// We transform that into the
-					// equivalent dereference of destReg:
-					//   l?? destReg, 0(destReg)
-					origInstructionName := instructionName
-					instructionName = ""
-
-					assertNodeType(memRef, ruleBaseIndexScale)
-					assertNodeType(memRef.up, ruleRegisterOrConstant)
-					if memRef.next != nil || memRef.up.next != nil {
-						return nil, errors.New("expected single register in BaseIndexScale for ld argument")
-					}
-
-					baseReg := destReg
-					if baseReg == "0" {
-						// Register zero is special as the base register for a load.
-						// Avoid it by spilling and using r3 instead.
-						baseReg = "3"
-						wrappers = append(wrappers, func(k func()) {
-							d.output.WriteString("\taddi 1, 1, -288\n") // Clear the red zone.
-							d.output.WriteString("\tstd " + baseReg + ", -8(1)\n")
-							d.output.WriteString("\tmr " + baseReg + ", " + destReg + "\n")
-							k()
-							d.output.WriteString("\tld " + baseReg + ", -8(1)\n")
-							d.output.WriteString("\taddi 1, 1, 288\n") // Clear the red zone.
-						})
-					}
-
-					wrappers = append(wrappers, func(k func()) {
-						d.output.WriteString("\t" + origInstructionName + " " + destReg + ", 0(" + baseReg + ")\n")
-					})
-				default:
-					return nil, fmt.Errorf("can't process TOC argument to %q", instructionName)
-				}
-
-			default:
-				return nil, fmt.Errorf("Unknown section type %q", section)
-			}
-
-			argStr := ""
-			if isIndirect {
-				argStr += "*"
-			}
-			argStr += symbol
-			if len(offset) > 0 {
-				argStr += offset
-			}
-			if len(section) > 0 {
-				argStr += "@"
-				argStr += section
-			}
-
-			for ; memRef != nil; memRef = memRef.next {
-				argStr += d.contents(memRef)
-			}
-
-			args = append(args, argStr)
-
-		default:
-			panic(fmt.Sprintf("unknown instruction argument type %q", rul3s[arg.pegRule]))
-		}
-	}
-
-	if changed {
-		d.writeCommentedNode(statement)
-
-		var replacement string
-		if len(instructionName) > 0 {
-			replacement = "\t" + instructionName + "\t" + strings.Join(args, ", ") + "\n"
-		}
-
-		wrappers.do(func() {
-			d.output.WriteString(replacement)
-		})
-	} else {
-		d.writeNode(statement)
-	}
-
-	return statement, nil
 }
 
 /* Intel */
@@ -1291,6 +980,12 @@ func (d *delocation) isRIPRelative(node *node32) bool {
 }
 
 func (d *delocation) processIntelInstruction(statement, instruction *node32) (*node32, error) {
+	var prefix string
+	if instruction.pegRule == ruleInstructionPrefix {
+		prefix = d.contents(instruction)
+		instruction = skipWS(instruction.next)
+	}
+
 	assertNodeType(instruction, ruleInstructionName)
 	instructionName := d.contents(instruction)
 
@@ -1317,37 +1012,6 @@ Args:
 		case ruleMemoryRef:
 			symbol, offset, section, didChange, symbolIsLocal, memRef := d.parseMemRef(arg.up)
 			changed = didChange
-
-			if symbol == "OPENSSL_ia32cap_P" && section == "" {
-				if instructionName != "leaq" {
-					return nil, fmt.Errorf("non-leaq instruction %q referenced OPENSSL_ia32cap_P directly", instructionName)
-				}
-
-				if i != 0 || len(argNodes) != 2 || !d.isRIPRelative(memRef) || len(offset) > 0 {
-					return nil, fmt.Errorf("invalid OPENSSL_ia32cap_P reference in instruction %q", instructionName)
-				}
-
-				target := argNodes[1]
-				assertNodeType(target, ruleRegisterOrConstant)
-				reg := d.contents(target)
-
-				if !strings.HasPrefix(reg, "%r") {
-					return nil, fmt.Errorf("tried to load OPENSSL_ia32cap_P into %q, which is not a standard register.", reg)
-				}
-
-				changed = true
-
-				// Flag-altering instructions (i.e. addq) are going to be used so the
-				// flags need to be preserved.
-				wrappers = append(wrappers, saveFlags(d.output, false /* Red Zone not yet cleared */))
-
-				wrappers = append(wrappers, func(k func()) {
-					d.output.WriteString("\tleaq\tOPENSSL_ia32cap_addr_delta(%rip), " + reg + "\n")
-					d.output.WriteString("\taddq\t(" + reg + "), " + reg + "\n")
-				})
-
-				break Args
-			}
 
 			switch section {
 			case "":
@@ -1491,15 +1155,7 @@ Args:
 					redzoneCleared = true
 				}
 
-				if symbol == "OPENSSL_ia32cap_P" {
-					// Flag-altering instructions (i.e. addq) are going to be used so the
-					// flags need to be preserved.
-					wrappers = append(wrappers, saveFlags(d.output, redzoneCleared))
-					wrappers = append(wrappers, func(k func()) {
-						d.output.WriteString("\tleaq\tOPENSSL_ia32cap_addr_delta(%rip), " + targetReg + "\n")
-						d.output.WriteString("\taddq\t(" + targetReg + "), " + targetReg + "\n")
-					})
-				} else if useGOT {
+				if useGOT {
 					wrappers = append(wrappers, d.loadFromGOT(d.output, targetReg, symbol, section, redzoneCleared))
 				} else {
 					wrappers = append(wrappers, func(k func()) {
@@ -1529,7 +1185,30 @@ Args:
 				argStr += d.contents(memRef)
 			}
 
+			for suffix := arg.next; suffix != nil; suffix = suffix.next {
+				argStr += d.contents(suffix)
+			}
+
 			args = append(args, argStr)
+
+		case ruleGOTAddress:
+			if instructionName != "leaq" {
+				return nil, fmt.Errorf("_GLOBAL_OFFSET_TABLE_ used outside of lea")
+			}
+			if i != 0 || len(argNodes) != 2 {
+				return nil, fmt.Errorf("Load of _GLOBAL_OFFSET_TABLE_ address didn't have expected form")
+			}
+			if arg.next != nil {
+				return nil, fmt.Errorf("unexpected argument suffix")
+			}
+			d.gotDeltaNeeded = true
+			changed = true
+			targetReg := d.contents(argNodes[1])
+			args = append(args, ".Lboringssl_got_delta(%rip)")
+			wrappers = append(wrappers, func(k func()) {
+				k()
+				d.output.WriteString(fmt.Sprintf("\taddq .Lboringssl_got_delta(%%rip), %s\n", targetReg))
+			})
 
 		case ruleGOTLocation:
 			if instructionName != "movabsq" {
@@ -1537,6 +1216,9 @@ Args:
 			}
 			if i != 0 || len(argNodes) != 2 {
 				return nil, fmt.Errorf("movabs of _GLOBAL_OFFSET_TABLE_ didn't expected form")
+			}
+			if arg.next != nil {
+				return nil, fmt.Errorf("unexpected argument suffix")
 			}
 
 			d.gotDeltaNeeded = true
@@ -1557,6 +1239,9 @@ Args:
 			}
 			if i != 0 || len(argNodes) != 2 {
 				return nil, fmt.Errorf("movabs of _GLOBAL_OFFSET_TABLE_ offset didn't have expected form")
+			}
+			if arg.next != nil {
+				return nil, fmt.Errorf("unexpected argument suffix")
 			}
 
 			assertNodeType(arg.up, ruleSymbolName)
@@ -1592,6 +1277,9 @@ Args:
 	if changed {
 		d.writeCommentedNode(statement)
 		replacement := "\t" + instructionName + "\t" + strings.Join(args, ", ") + "\n"
+		if len(prefix) != 0 {
+			replacement = "\t" + prefix + replacement
+		}
 		wrappers.do(func() {
 			d.output.WriteString(replacement)
 		})
@@ -1643,6 +1331,13 @@ func (d *delocation) handleBSS(statement *node32) (*node32, error) {
 				return nil, err
 			}
 
+		case ruleSymbolDefiningDirective:
+			var err error
+			statement, err = d.processSymbolDefiningDirective(statement, node.up)
+			if err != nil {
+				return nil, err
+			}
+
 		default:
 			return nil, fmt.Errorf("unknown BSS statement type %q in %q", rul3s[node.pegRule], d.contents(statement))
 		}
@@ -1657,6 +1352,16 @@ func writeAarch64Function(w stringWriter, funcName string, writeContents func(st
 	w.WriteString(".type " + funcName + ", @function\n")
 	w.WriteString(funcName + ":\n")
 	w.WriteString(".cfi_startproc\n")
+	// We insert a landing pad (`bti c` instruction) unconditionally at the beginning of
+	// every generated function so that they can be called indirectly (with `blr` or
+	// `br x16/x17`). The instruction is encoded in the HINT space as `hint #34` and is
+	// a no-op on machines or program states not supporting BTI (Branch Target Identification).
+	// None of the generated function bodies call other functions (with bl or blr), so we only
+	// insert a landing pad instead of signing and validating $lr with `paciasp` and `autiasp`.
+	// Normally we would also generate a .note.gnu.property section to annotate the assembly
+	// file as BTI-compatible, but if the input assembly files are BTI-compatible, they should
+	// already have those sections so there is no need to add an extra one ourselves.
+	w.WriteString("\thint #34 // bti c\n")
 	writeContents(w)
 	w.WriteString(".cfi_endproc\n")
 	w.WriteString(".size " + funcName + ", .-" + funcName + "\n")
@@ -1665,8 +1370,6 @@ func writeAarch64Function(w stringWriter, funcName string, writeContents func(st
 func transform(w stringWriter, inputs []inputFile) error {
 	// symbols contains all defined symbols.
 	symbols := make(map[string]struct{})
-	// localEntrySymbols contains all symbols with a .localentry directive.
-	localEntrySymbols := make(map[string]struct{})
 	// fileNumbers is the set of IDs seen in .file directives.
 	fileNumbers := make(map[int]struct{})
 	// maxObservedFileNumber contains the largest seen file number in a
@@ -1677,9 +1380,6 @@ func transform(w stringWriter, inputs []inputFile) error {
 	// to match that behaviour otherwise warnings result.
 	fileDirectivesContainMD5 := false
 
-	// OPENSSL_ia32cap_get will be synthesized by this script.
-	symbols["OPENSSL_ia32cap_get"] = struct{}{}
-
 	for _, input := range inputs {
 		forEachPath(input.ast.up, func(node *node32) {
 			symbol := input.contents[node.begin:node.end]
@@ -1689,24 +1389,17 @@ func transform(w stringWriter, inputs []inputFile) error {
 			symbols[symbol] = struct{}{}
 		}, ruleStatement, ruleLabel, ruleSymbolName)
 
+		// Some directives also define symbols.
 		forEachPath(input.ast.up, func(node *node32) {
-			node = node.up
-			assertNodeType(node, ruleLabelContainingDirectiveName)
-			directive := input.contents[node.begin:node.end]
-			if directive != ".localentry" {
+			node = skipWS(node.next)
+			if node.pegRule == ruleLocalSymbol {
 				return
 			}
-			// Extract the first argument.
-			node = skipWS(node.next)
-			assertNodeType(node, ruleSymbolArgs)
-			node = node.up
-			assertNodeType(node, ruleSymbolArg)
+			assertNodeType(node, ruleSymbolName)
 			symbol := input.contents[node.begin:node.end]
-			if _, ok := localEntrySymbols[symbol]; ok {
-				panic(fmt.Sprintf("Duplicate .localentry directive found: %q in %q", symbol, input.path))
-			}
-			localEntrySymbols[symbol] = struct{}{}
-		}, ruleStatement, ruleLabelContainingDirective)
+			// Allow duplicates. A symbol may be set multiple times with .set.
+			symbols[symbol] = struct{}{}
+		}, ruleStatement, ruleSymbolDefiningDirective, ruleSymbolDefiningDirectiveName)
 
 		forEachPath(input.ast.up, func(node *node32) {
 			assertNodeType(node, ruleLocationDirective)
@@ -1756,13 +1449,11 @@ func transform(w stringWriter, inputs []inputFile) error {
 
 	d := &delocation{
 		symbols:             symbols,
-		localEntrySymbols:   localEntrySymbols,
 		processor:           processor,
 		commentIndicator:    commentIndicator,
 		output:              w,
 		redirectors:         make(map[string]string),
 		bssAccessorsNeeded:  make(map[string]string),
-		tocLoaders:          make(map[string]struct{}),
 		gotExternalsNeeded:  make(map[string]struct{}),
 		gotOffsetsNeeded:    make(map[string]struct{}),
 		gotOffOffsetsNeeded: make(map[string]struct{}),
@@ -1797,22 +1488,6 @@ func transform(w stringWriter, inputs []inputFile) error {
 	for _, name := range redirectorNames {
 		redirector := d.redirectors[name]
 		switch d.processor {
-		case ppc64le:
-			w.WriteString(".section \".toc\", \"aw\"\n")
-			w.WriteString(".Lredirector_toc_" + name + ":\n")
-			w.WriteString(".quad " + name + "\n")
-			w.WriteString(".text\n")
-			w.WriteString(".type " + redirector + ", @function\n")
-			w.WriteString(redirector + ":\n")
-			// |name| will clobber r2, so save it. This is matched by a restore in
-			// redirector calls.
-			w.WriteString("\tstd 2, 24(1)\n")
-			// Load and call |name|'s global entry point.
-			w.WriteString("\taddis 12, 2, .Lredirector_toc_" + name + "@toc@ha\n")
-			w.WriteString("\tld 12, .Lredirector_toc_" + name + "@toc@l(12)\n")
-			w.WriteString("\tmtctr 12\n")
-			w.WriteString("\tbctr\n")
-
 		case aarch64:
 			writeAarch64Function(w, redirector, func(w stringWriter) {
 				w.WriteString("\tb " + name + "\n")
@@ -1837,13 +1512,6 @@ func transform(w stringWriter, inputs []inputFile) error {
 		target := d.bssAccessorsNeeded[name]
 
 		switch d.processor {
-		case ppc64le:
-			w.WriteString(".type " + funcName + ", @function\n")
-			w.WriteString(funcName + ":\n")
-			w.WriteString("\taddis 3, 2, " + target + "@toc@ha\n")
-			w.WriteString("\taddi 3, 3, " + target + "@toc@l\n")
-			w.WriteString("\tblr\n")
-
 		case x86_64:
 			w.WriteString(".type " + funcName + ", @function\n")
 			w.WriteString(funcName + ":\n")
@@ -1859,26 +1527,6 @@ func transform(w stringWriter, inputs []inputFile) error {
 	}
 
 	switch d.processor {
-	case ppc64le:
-		loadTOCNames := sortedSet(d.tocLoaders)
-		for _, symbolAndOffset := range loadTOCNames {
-			parts := strings.SplitN(symbolAndOffset, "\x00", 2)
-			symbol, offset := parts[0], parts[1]
-
-			funcName := loadTOCFuncName(symbol, offset)
-			ref := symbol + offset
-
-			w.WriteString(".type " + funcName[2:] + ", @function\n")
-			w.WriteString(funcName[2:] + ":\n")
-			w.WriteString(funcName + ":\n")
-			w.WriteString("\taddis 3, 2, " + ref + "@toc@ha\n")
-			w.WriteString("\taddi 3, 3, " + ref + "@toc@l\n")
-			w.WriteString("\tblr\n")
-		}
-
-		w.WriteString(".LBORINGSSL_external_toc:\n")
-		w.WriteString(".quad .TOC.-.LBORINGSSL_external_toc\n")
-
 	case aarch64:
 		externalNames := sortedSet(d.gotExternalsNeeded)
 		for _, symbol := range externalNames {
@@ -1888,12 +1536,6 @@ func transform(w stringWriter, inputs []inputFile) error {
 				w.WriteString("\tret\n")
 			})
 		}
-
-		writeAarch64Function(w, ".LOPENSSL_armcap_P_addr", func(w stringWriter) {
-			w.WriteString("\tadrp x0, OPENSSL_armcap_P\n")
-			w.WriteString("\tadd x0, x0, :lo12:OPENSSL_armcap_P\n")
-			w.WriteString("\tret\n")
-		})
 
 	case x86_64:
 		externalNames := sortedSet(d.gotExternalsNeeded)
@@ -1911,19 +1553,6 @@ func transform(w stringWriter, inputs []inputFile) error {
 			w.WriteString("\t.long 0\n")
 		}
 
-		w.WriteString(".type OPENSSL_ia32cap_get, @function\n")
-		w.WriteString(".globl OPENSSL_ia32cap_get\n")
-		w.WriteString(localTargetName("OPENSSL_ia32cap_get") + ":\n")
-		w.WriteString("OPENSSL_ia32cap_get:\n")
-		w.WriteString("\tleaq OPENSSL_ia32cap_P(%rip), %rax\n")
-		w.WriteString("\tret\n")
-
-		w.WriteString(".extern OPENSSL_ia32cap_P\n")
-		w.WriteString(".type OPENSSL_ia32cap_addr_delta, @object\n")
-		w.WriteString(".size OPENSSL_ia32cap_addr_delta, 8\n")
-		w.WriteString("OPENSSL_ia32cap_addr_delta:\n")
-		w.WriteString(".quad OPENSSL_ia32cap_P-OPENSSL_ia32cap_addr_delta\n")
-
 		if d.gotDeltaNeeded {
 			w.WriteString(".Lboringssl_got_delta:\n")
 			w.WriteString("\t.quad _GLOBAL_OFFSET_TABLE_-.Lboringssl_got_delta\n")
@@ -1940,7 +1569,7 @@ func transform(w stringWriter, inputs []inputFile) error {
 	}
 
 	w.WriteString(".type BORINGSSL_bcm_text_hash, @object\n")
-	w.WriteString(".size BORINGSSL_bcm_text_hash, 64\n")
+	w.WriteString(".size BORINGSSL_bcm_text_hash, 32\n")
 	w.WriteString("BORINGSSL_bcm_text_hash:\n")
 	for _, b := range fipscommon.UninitHashValue {
 		w.WriteString(".byte 0x" + strconv.FormatUint(uint64(b), 16) + "\n")
@@ -1949,7 +1578,25 @@ func transform(w stringWriter, inputs []inputFile) error {
 	return nil
 }
 
-func parseInputs(inputs []inputFile) error {
+// preprocess runs source through the C preprocessor.
+func preprocess(cppCommand []string, path string) ([]byte, error) {
+	var args []string
+	args = append(args, cppCommand...)
+	args = append(args, path)
+
+	cpp := exec.Command(args[0], args[1:]...)
+	cpp.Stderr = os.Stderr
+	var result bytes.Buffer
+	cpp.Stdout = &result
+
+	if err := cpp.Run(); err != nil {
+		return nil, err
+	}
+
+	return result.Bytes(), nil
+}
+
+func parseInputs(inputs []inputFile, cppCommand []string) error {
 	for i, input := range inputs {
 		var contents string
 
@@ -1973,7 +1620,14 @@ func parseInputs(inputs []inputFile) error {
 				contents = string(c)
 			}
 		} else {
-			inBytes, err := ioutil.ReadFile(input.path)
+			var inBytes []byte
+			var err error
+
+			if len(cppCommand) > 0 {
+				inBytes, err = preprocess(cppCommand, input.path)
+			} else {
+				inBytes, err = os.ReadFile(input.path)
+			}
 			if err != nil {
 				return err
 			}
@@ -1995,12 +1649,36 @@ func parseInputs(inputs []inputFile) error {
 	return nil
 }
 
+// includePathFromHeaderFilePath returns an include directory path based on the
+// path of a specific header file. It walks up the path and assumes that the
+// include files are rooted in a directory called "openssl".
+func includePathFromHeaderFilePath(path string) (string, error) {
+	dir := path
+	for {
+		var file string
+		dir, file = filepath.Split(dir)
+
+		if file == "openssl" {
+			return dir, nil
+		}
+
+		if len(dir) == 0 {
+			break
+		}
+		dir = dir[:len(dir)-1]
+	}
+
+	return "", fmt.Errorf("failed to find 'openssl' path element in header file path %q", path)
+}
+
 func main() {
 	// The .a file, if given, is expected to be an archive of textual
 	// assembly sources. That's odd, but CMake really wants to create
 	// archive files so it's the only way that we can make it work.
 	arInput := flag.String("a", "", "Path to a .a file containing assembly sources")
 	outFile := flag.String("o", "", "Path to output assembly")
+	ccPath := flag.String("cc", "", "Path to the C compiler for preprocessing inputs")
+	ccFlags := flag.String("cc-flags", "", "Flags for the C compiler when preprocessing")
 
 	flag.Parse()
 
@@ -2018,8 +1696,22 @@ func main() {
 		})
 	}
 
+	includePaths := make(map[string]struct{})
+
 	for i, path := range flag.Args() {
 		if len(path) == 0 {
+			continue
+		}
+
+		// Header files are not processed but their path is remembered
+		// and passed as -I arguments when invoking the preprocessor.
+		if strings.HasSuffix(path, ".h") {
+			dir, err := includePathFromHeaderFilePath(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s\n", err)
+				os.Exit(1)
+			}
+			includePaths[dir] = struct{}{}
 			continue
 		}
 
@@ -2029,7 +1721,24 @@ func main() {
 		})
 	}
 
-	if err := parseInputs(inputs); err != nil {
+	var cppCommand []string
+	if len(*ccPath) > 0 {
+		cppCommand = append(cppCommand, *ccPath)
+		cppCommand = append(cppCommand, strings.Fields(*ccFlags)...)
+		// Some of ccFlags might be superfluous when running the
+		// preprocessor, but we don't want the compiler complaining that
+		// "argument unused during compilation".
+		cppCommand = append(cppCommand, "-Wno-unused-command-line-argument")
+
+		for includePath := range includePaths {
+			cppCommand = append(cppCommand, "-I"+includePath)
+		}
+
+		// -E requests only preprocessing.
+		cppCommand = append(cppCommand, "-E")
+	}
+
+	if err := parseInputs(inputs, cppCommand); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}
@@ -2109,13 +1818,8 @@ func localTargetName(name string) string {
 	return ".L" + name + "_local_target"
 }
 
-func localEntryName(name string) string {
-	return ".L" + name + "_local_entry"
-}
-
 func isSynthesized(symbol string) bool {
 	return strings.HasSuffix(symbol, "_bss_get") ||
-		symbol == "OPENSSL_ia32cap_get" ||
 		strings.HasPrefix(symbol, "BORINGSSL_bcm_text_")
 }
 
@@ -2168,8 +1872,6 @@ func detectProcessor(input inputFile) processorType {
 		switch instructionName {
 		case "movq", "call", "leaq":
 			return x86_64
-		case "addis", "addi", "mflr":
-			return ppc64le
 		case "str", "bl", "ldr", "st1":
 			return aarch64
 		}

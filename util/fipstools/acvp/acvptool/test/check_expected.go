@@ -1,16 +1,18 @@
-// Copyright (c) 2021, Google Inc.
+// Copyright 2021 The BoringSSL Authors
 //
-// Permission to use, copy, modify, and/or distribute this software for any
-// purpose with or without fee is hereby granted, provided that the above
-// copyright notice and this permission notice appear in all copies.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
-// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
-// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
-// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build ignore
 
 package main
 
@@ -21,7 +23,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -43,6 +44,7 @@ type invocation struct {
 	wrapperPath  string
 	inPath       string
 	expectedPath string
+	configPath   string
 }
 
 func main() {
@@ -86,6 +88,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	configFile, err := os.CreateTemp("", "boringssl-check_expected-config-")
+	if err != nil {
+		log.Fatalf("Failed to create temp file for config: %s", err)
+	}
+	defer os.Remove(configFile.Name())
+	if _, err := configFile.WriteString("{}\n"); err != nil {
+		log.Fatalf("Failed to write config file: %s", err)
+	}
+
 	work := make(chan invocation, runtime.NumCPU())
 	var numFailed uint32
 
@@ -105,6 +116,7 @@ func main() {
 			wrapperPath:  wrapper,
 			inPath:       test.In,
 			expectedPath: test.Out,
+			configPath:   configFile.Name(),
 		}
 	}
 
@@ -138,7 +150,7 @@ func doTest(test invocation) error {
 	}
 	defer input.Close()
 
-	tempFile, err := ioutil.TempFile("", "boringssl-check_expected-")
+	tempFile, err := os.CreateTemp("", "boringssl-check_expected-")
 	if err != nil {
 		return fmt.Errorf("Failed to create temp file: %s", err)
 	}
@@ -150,7 +162,7 @@ func doTest(test invocation) error {
 		return fmt.Errorf("Failed to decompress %q: %s", test.inPath, err)
 	}
 
-	cmd := exec.Command(test.toolPath, "-wrapper", test.wrapperPath, "-json", tempFile.Name())
+	cmd := exec.Command(test.toolPath, "-wrapper", test.wrapperPath, "-json", tempFile.Name(), "-config", test.configPath)
 	result, err := cmd.CombinedOutput()
 	if err != nil {
 		os.Stderr.Write(result)
@@ -190,7 +202,8 @@ func doTest(test invocation) error {
 }
 
 func writeUpdate(path string, contents []byte) {
-	if err := ioutil.WriteFile(path, contents, 0644); err != nil {
+	path = strings.TrimSuffix(path, ".bz2")
+	if err := os.WriteFile(path, contents, 0644); err != nil {
 		log.Printf("Failed to create missing file %q: %s", path, err)
 	} else {
 		log.Printf("Wrote %q", path)

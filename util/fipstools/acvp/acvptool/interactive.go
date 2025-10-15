@@ -1,18 +1,18 @@
-// Copyright (c) 2019, Google Inc.
+// Copyright 2019 The BoringSSL Authors
 //
-// Permission to use, copy, modify, and/or distribute this software for any
-// purpose with or without fee is hereby granted, provided that the above
-// copyright notice and this permission notice appear in all copies.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
-// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
-// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
-// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-// +build interactive
+//go:build interactive
 
 package main
 
@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	neturl "net/url"
 	"os"
 	"os/exec"
@@ -33,7 +32,7 @@ import (
 	"strings"
 	"syscall"
 
-	"boringssl.googlesource.com/boringssl/util/fipstools/acvp/acvptool/acvp"
+	"boringssl.googlesource.com/boringssl.git/util/fipstools/acvp/acvptool/acvp"
 	"golang.org/x/crypto/ssh/terminal"
 )
 
@@ -142,7 +141,7 @@ func (set ServerObjectSet) Action(action string, args []string) error {
 			return nil
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		if err := set.env.server.Post(&result, "acvp/v1/"+set.name, newContents); err != nil {
 			return err
 		}
@@ -158,7 +157,7 @@ func (set ServerObjectSet) Action(action string, args []string) error {
 						}
 						set.env.server.PrefixTokens[url] = token
 						if len(set.env.config.SessionTokensCache) > 0 {
-							ioutil.WriteFile(filepath.Join(set.env.config.SessionTokensCache, neturl.PathEscape(url))+".token", []byte(token), 0600)
+							os.WriteFile(filepath.Join(set.env.config.SessionTokensCache, neturl.PathEscape(url))+".token", []byte(token), 0600)
 						}
 					}
 				}
@@ -204,7 +203,7 @@ func (ServerObject) Search(condition acvp.Query) (Object, error) {
 }
 
 func edit(initialContents string) ([]byte, error) {
-	tmp, err := ioutil.TempFile("", "acvp*.json")
+	tmp, err := os.CreateTemp("", "acvp*.json")
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +229,7 @@ func edit(initialContents string) ([]byte, error) {
 		return nil, err
 	}
 
-	return ioutil.ReadFile(path)
+	return os.ReadFile(path)
 }
 
 func (obj ServerObject) Action(action string, args []string) error {
@@ -308,7 +307,7 @@ type Algorithms struct {
 
 func (algos Algorithms) String() (string, error) {
 	var result struct {
-		Algorithms []map[string]interface{} `json:"algorithms"`
+		Algorithms []map[string]any `json:"algorithms"`
 	}
 	if err := algos.env.server.Get(&result, "acvp/v1/algorithms"); err != nil {
 		return "", err
@@ -360,7 +359,7 @@ func (s stringLiteral) Action(action string, args []string) error {
 			return fmt.Errorf("found %d arguments but %q takes none", len(args), action)
 		}
 
-		var results map[string]interface{}
+		var results map[string]any
 		if err := s.env.server.Get(&results, s.contents); err != nil {
 			return err
 		}
@@ -379,7 +378,7 @@ type results struct {
 }
 
 func (r results) String() (string, error) {
-	var results map[string]interface{}
+	var results map[string]any
 	if err := r.env.server.Get(&results, "acvp/v1/"+r.prefix+"/results"); err != nil {
 		return "", err
 	}

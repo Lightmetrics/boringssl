@@ -53,32 +53,45 @@ foo:
 	adr x0, .Llocal_data
 // WAS add x0, x0, :lo12:.Llocal_data
 
-	// armcap
-// WAS adrp x1, OPENSSL_armcap_P
-	sub sp, sp, 128
-	stp x0, lr, [sp, #-16]!
-	bl .LOPENSSL_armcap_P_addr
-	mov x1, x0
-	ldp x0, lr, [sp], #16
-	add sp, sp, 128
-// WAS ldr w2, [x1, :lo12:OPENSSL_armcap_P]
-	ldr	w2, [x1]
-
-	// armcap to w0
-// WAS adrp x0, OPENSSL_armcap_P
-	sub sp, sp, 128
-	stp x0, lr, [sp, #-16]!
-	bl .LOPENSSL_armcap_P_addr
-	ldp xzr, lr, [sp], #16
-	add sp, sp, 128
-// WAS ldr w1, [x1, :lo12:OPENSSL_armcap_P]
-	ldr	w1, [x1]
-
 	// Load from local symbol
 // WAS adrp x10, .Llocal_data2
 	adr x10, .Llocal_data2
 // WAS ldr q0, [x10, :lo12:.Llocal_data2]
 	ldr	q0, [x10]
+// WAS ldr x0, [x10, :lo12:.Llocal_data2]
+	ldr	x0, [x10]
+// WAS ldr w0, [x10, :lo12:.Llocal_data2]
+	ldr	w0, [x10]
+// WAS ldrh w0, [x10, :lo12:.Llocal_data2]
+	ldrh	w0, [x10]
+// WAS ldrb w0, [x10, :lo12:.Llocal_data2]
+	ldrb	w0, [x10]
+// WAS ldrsw x0, [x10, :lo12:.Llocal_data2]
+	ldrsw	x0, [x10]
+// WAS ldrsh w0, [x10, :lo12:.Llocal_data2]
+	ldrsh	w0, [x10]
+// WAS ldrsb w0, [x10, :lo12:.Llocal_data2]
+	ldrsb	w0, [x10]
+
+	// Load from local symbol with offset
+// WAS adrp x10, .Llocal_data2+16
+	adr x10, .Llocal_data2+16
+// WAS ldr q0, [x10, :lo12:.Llocal_data2+16]
+	ldr	q0, [x10]
+// WAS ldr x0, [x10, :lo12:.Llocal_data2+16]
+	ldr	x0, [x10]
+// WAS ldr w0, [x10, :lo12:.Llocal_data2+16]
+	ldr	w0, [x10]
+// WAS ldrh w0, [x10, :lo12:.Llocal_data2+16]
+	ldrh	w0, [x10]
+// WAS ldrb w0, [x10, :lo12:.Llocal_data2+16]
+	ldrb	w0, [x10]
+// WAS ldrsw x0, [x10, :lo12:.Llocal_data2+16]
+	ldrsw	x0, [x10]
+// WAS ldrsh w0, [x10, :lo12:.Llocal_data2+16]
+	ldrsh	w0, [x10]
+// WAS ldrsb w0, [x10, :lo12:.Llocal_data2+16]
+	ldrsb	w0, [x10]
 
 // WAS bl local_function
 	bl	.Llocal_function_local_target
@@ -88,9 +101,62 @@ foo:
 
 	bl bss_symbol_bss_get
 
-	# Regression test for a two-digit index.
+	// Regression test for a two-digit index.
 	ld1 { v1.b }[10], [x9]
 
+	// Ensure that registers aren't interpreted as symbols.
+	add x0, x0
+	add x12, x12
+	add w0, x0
+	add w12, x12
+	add d0, d0
+	add d12, d12
+	add q0, q0
+	add q12, q12
+	add s0, s0
+	add s12, s12
+	add h0, h0
+	add h12, h12
+	add b0, b0
+	add b12, b12
+
+	// But 'y' is not a register prefix so far, so these should be
+	// processed as symbols.
+// WAS add y0, y0
+	add	bcm_redirector_y0, bcm_redirector_y0
+// WAS add y12, y12
+	add	bcm_redirector_y12, bcm_redirector_y12
+
+	// Make sure that the magic extension constants are recognised rather
+	// than being interpreted as symbols.
+	add w0, w1, b2, uxtb
+	add w0, w1, b2, uxth
+	add w0, w1, b2, uxtw
+	add w0, w1, b2, uxtx
+	add w0, w1, b2, sxtb
+	add w0, w1, b2, sxth
+	add w0, w1, b2, sxtw
+	add w0, w1, b2, sxtx
+	movi v0.4s, #3, msl #8
+
+	// Aarch64 SVE2 added these forms:
+	ld1d { z1.d }, p91/z, [x13, x11, lsl #3]
+	ld1b { z11.b }, p15/z, [x10, #1, mul vl]
+	st2d { z6.d, z7.d }, p0, [x12]
+	// Check that "p22" here isn't parsed as the "p22" register.
+// WAS bl p224_point_add
+	bl	bcm_redirector_p224_point_add
+	ptrue p0.d, vl1
+	// The "#7" here isn't a comment, it's now valid Aarch64 assembly.
+	cnth x8, all, mul #7
+
+	// fcmp can compare against zero, which is expressed with a floating-
+	// point zero literal in the instruction. Again, this is not a
+	// comment.
+	fcmp d0, #0.0
+
+  # cnth allows a 4-bit immediate.
+  cnth x10, all, mul #15
 
 .Llocal_function_local_target:
 local_function:
@@ -107,18 +173,47 @@ bss_symbol:
 .loc 1 2 0
 BORINGSSL_bcm_text_end:
 .p2align 2
+.hidden bcm_redirector_p224_point_add
+.type bcm_redirector_p224_point_add, @function
+bcm_redirector_p224_point_add:
+.cfi_startproc
+	hint #34 // bti c
+	b p224_point_add
+.cfi_endproc
+.size bcm_redirector_p224_point_add, .-bcm_redirector_p224_point_add
+.p2align 2
 .hidden bcm_redirector_remote_function
 .type bcm_redirector_remote_function, @function
 bcm_redirector_remote_function:
 .cfi_startproc
+	hint #34 // bti c
 	b remote_function
 .cfi_endproc
 .size bcm_redirector_remote_function, .-bcm_redirector_remote_function
+.p2align 2
+.hidden bcm_redirector_y0
+.type bcm_redirector_y0, @function
+bcm_redirector_y0:
+.cfi_startproc
+	hint #34 // bti c
+	b y0
+.cfi_endproc
+.size bcm_redirector_y0, .-bcm_redirector_y0
+.p2align 2
+.hidden bcm_redirector_y12
+.type bcm_redirector_y12, @function
+bcm_redirector_y12:
+.cfi_startproc
+	hint #34 // bti c
+	b y12
+.cfi_endproc
+.size bcm_redirector_y12, .-bcm_redirector_y12
 .p2align 2
 .hidden bss_symbol_bss_get
 .type bss_symbol_bss_get, @function
 bss_symbol_bss_get:
 .cfi_startproc
+	hint #34 // bti c
 	adrp x0, .Lbss_symbol_local_target
 	add x0, x0, :lo12:.Lbss_symbol_local_target
 	ret
@@ -129,23 +224,14 @@ bss_symbol_bss_get:
 .type .Lboringssl_loadgot_stderr, @function
 .Lboringssl_loadgot_stderr:
 .cfi_startproc
+	hint #34 // bti c
 	adrp x0, :got:stderr
 	ldr x0, [x0, :got_lo12:stderr]
 	ret
 .cfi_endproc
 .size .Lboringssl_loadgot_stderr, .-.Lboringssl_loadgot_stderr
-.p2align 2
-.hidden .LOPENSSL_armcap_P_addr
-.type .LOPENSSL_armcap_P_addr, @function
-.LOPENSSL_armcap_P_addr:
-.cfi_startproc
-	adrp x0, OPENSSL_armcap_P
-	add x0, x0, :lo12:OPENSSL_armcap_P
-	ret
-.cfi_endproc
-.size .LOPENSSL_armcap_P_addr, .-.LOPENSSL_armcap_P_addr
 .type BORINGSSL_bcm_text_hash, @object
-.size BORINGSSL_bcm_text_hash, 64
+.size BORINGSSL_bcm_text_hash, 32
 BORINGSSL_bcm_text_hash:
 .byte 0xae
 .byte 0x2c
@@ -179,35 +265,3 @@ BORINGSSL_bcm_text_hash:
 .byte 0xff
 .byte 0x31
 .byte 0x80
-.byte 0xa2
-.byte 0xd4
-.byte 0xc3
-.byte 0x66
-.byte 0xf
-.byte 0xc2
-.byte 0x6a
-.byte 0x7b
-.byte 0xf4
-.byte 0xbe
-.byte 0x39
-.byte 0xa2
-.byte 0xd7
-.byte 0x25
-.byte 0xdb
-.byte 0x21
-.byte 0x98
-.byte 0xe9
-.byte 0xd5
-.byte 0x53
-.byte 0xbf
-.byte 0x5c
-.byte 0x32
-.byte 0x6
-.byte 0x83
-.byte 0x34
-.byte 0xc
-.byte 0x65
-.byte 0x89
-.byte 0x52
-.byte 0xbd
-.byte 0x1f
